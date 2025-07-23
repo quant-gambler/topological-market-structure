@@ -1,0 +1,162 @@
+import yfinance as yf
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import scale
+from tqdm import tqdm
+
+# ----------------------------
+# PARAMETERS
+# ----------------------------
+tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'JPM', 'V', 'UNH', 'TSLA']  # Use more if you want
+start_date = "2018-01-01"
+end_date = "2023-12-31"
+window_size = 60  # rolling window (in trading days)
+
+# ----------------------------
+# STEP 1: Download stock data
+# ----------------------------
+raw_data = yf.download(tickers, start=start_date, end=end_date, group_by='ticker', auto_adjust=True)
+
+# Extract just the closing prices for each ticker
+data = pd.DataFrame({ticker: raw_data[ticker]['Close'] for ticker in tickers})
+
+
+# Drop rows with any missing prices
+data = data.dropna()
+
+# ----------------------------
+# STEP 2: Compute daily log returns
+# ----------------------------
+log_returns = np.log(data / data.shift(1)).dropna()
+
+# ----------------------------
+# STEP 3: Rolling correlation + distance matrix
+# ----------------------------
+def correlation_to_distance_matrix(corr_matrix):
+    # Convert correlation matrix to Euclidean-like distance matrix
+    dist_matrix = np.sqrt(2 * (1 - corr_matrix))
+    np.fill_diagonal(dist_matrix.values, 0)  # distances to self = 0
+    return dist_matrix
+
+# Store distance matrices over time
+rolling_distances = []
+
+dates = log_returns.index[window_size:]
+
+for i in tqdm(range(len(dates))):
+    window_returns = log_returns.iloc[i:i + window_size]
+    corr_matrix = window_returns.corr()
+    dist_matrix = correlation_to_distance_matrix(corr_matrix)
+    rolling_distances.append((dates[i], dist_matrix))
+from ripser import ripser
+from persim import plot_diagrams
+
+# Pick one distance matrix
+sample_date, dist_df = rolling_distances[0]
+print(f"Analyzing distance matrix from: {sample_date}")
+
+# Convert DataFrame to raw NumPy array
+dist_array = dist_df.to_numpy()
+
+# Run persistent homology directly on square distance matrix
+diagrams = ripser(dist_array, distance_matrix=True, maxdim=1)['dgms']
+
+# Plot the persistence diagrams
+plot_diagrams(diagrams, show=True)
+betti_1_series = []
+
+for date, dist_df in tqdm(rolling_distances):
+    dist_array = dist_df.to_numpy()
+    diagrams = ripser(dist_array, distance_matrix=True, maxdim=1)['dgms']
+    
+    # Count number of dimension-1 features (loops)
+    betti_1 = len(diagrams[1])
+    betti_1_series.append((date, betti_1))
+
+# Convert to pandas Series for easy plotting
+betti_1_df = pd.DataFrame(betti_1_series, columns=['Date', 'Betti_1'])
+betti_1_df.set_index('Date', inplace=True)
+plt.figure(figsize=(12, 5))
+plt.plot(betti_1_df.index, betti_1_df['Betti_1'], label='Betti-1 (loops)', color='orange')
+plt.title("Topological Complexity (Loops) in Market Correlation Structure")
+plt.xlabel("Date")
+plt.ylabel("Number of Persistent H₁ Features")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+total_persistence_series = []
+
+for date, dist_df in tqdm(rolling_distances):
+    dist_array = dist_df.to_numpy()
+    diagrams = ripser(dist_array, distance_matrix=True, maxdim=1)['dgms']
+    h1 = diagrams[1]
+
+    # Total persistence = sum of (death - birth) for all H1 features
+    total_persistence = np.sum(h1[:, 1] - h1[:, 0]) if len(h1) > 0 else 0
+    total_persistence_series.append((date, total_persistence))
+
+# Convert to DataFrame
+persistence_df = pd.DataFrame(total_persistence_series, columns=['Date', 'Total_H1_Persistence'])
+persistence_df.set_index('Date', inplace=True)
+plt.figure(figsize=(12, 5))
+plt.plot(persistence_df.index, persistence_df['Total_H1_Persistence'], label='Total H₁ Persistence', color='red')
+plt.title("Topological Signal Strength in Market Correlation Structure")
+plt.xlabel("Date")
+plt.ylabel("Total Persistence of H₁ Features")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+# Use average return across all stocks (market proxy)
+avg_returns = log_returns.mean(axis=1).to_frame(name='Market_Return')
+df = avg_returns.copy()
+df = df.join(betti_1_df)
+df = df.join(persistence_df)
+df = df.dropna()
+# Topological filter: only trade when structure is stable
+# Condition A: Betti-1 ≤ 1
+# Condition B: Total persistence ≤ 0.05 (adjust this)
+
+df['Trade_Signal'] = (df['Betti_1'] <= 1) & (df['Total_H1_Persistence'] <= 0.05)
+
+# Strategy returns with filter applied
+df['Strategy_Return'] = df['Market_Return'] * df['Trade_Signal']
+# Cumulative returns
+df['Cumulative_Market'] = (1 + df['Market_Return']).cumprod()
+df['Cumulative_Strategy'] = (1 + df['Strategy_Return']).cumprod()
+
+# Plot
+plt.figure(figsize=(12,6))
+plt.plot(df.index, df['Cumulative_Market'], label='Market (Unfiltered)', color='gray')
+plt.plot(df.index, df['Cumulative_Strategy'], label='Topological Strategy', color='green')
+plt.title("Strategy Performance With vs Without Topological Filter")
+plt.xlabel("Date")
+plt.ylabel("Cumulative Return")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+def compute_metrics(returns, risk_free=0):
+    daily_rf = risk_free / 252
+    excess_returns = returns - daily_rf
+    
+    sharpe = excess_returns.mean() / excess_returns.std() * np.sqrt(252)
+    volatility = returns.std() * np.sqrt(252)
+    cumulative = (1 + returns).cumprod()
+    drawdown = (cumulative / cumulative.cummax() - 1).min()
+    
+    return sharpe, volatility, drawdown
+
+# Compute for both strategies
+s_sharpe, s_vol, s_dd = compute_metrics(df['Strategy_Return'])
+m_sharpe, m_vol, m_dd = compute_metrics(df['Market_Return'])
+
+# Print nicely
+print("Performance Metrics:\n")
+print(f"{'Metric':<20}{'Topological':>15}{'Market':>15}")
+print("-" * 50)
+print(f"{'Sharpe Ratio':<20}{s_sharpe:>15.3f}{m_sharpe:>15.3f}")
+print(f"{'Volatility':<20}{s_vol:>15.3f}{m_vol:>15.3f}")
+print(f"{'Max Drawdown':<20}{s_dd:>15.2%}{m_dd:>15.2%}")
